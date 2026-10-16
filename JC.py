@@ -124,8 +124,11 @@ class JC_Models:
 
         if hasattr(self.processor, 'image_processor') and hasattr(self.processor.image_processor, 'size'):
             expected_size = self.processor.image_processor.size
-            if isinstance(expected_size, dict):
-                self.target_size = (expected_size.get('height', 336), expected_size.get('width', 336))
+            # transformers 5 returns a SizeDict (attributes, not a dict subclass); PIL wants (width, height).
+            if hasattr(expected_size, 'height') and hasattr(expected_size, 'width'):
+                self.target_size = (expected_size.width, expected_size.height)
+            elif isinstance(expected_size, dict):
+                self.target_size = (expected_size.get('width', 336), expected_size.get('height', 336))
             elif isinstance(expected_size, (list, tuple)):
                 self.target_size = tuple(expected_size) if len(expected_size) == 2 else (expected_size[0], expected_size[0])
             else:
