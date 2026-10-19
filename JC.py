@@ -1,11 +1,14 @@
 import torch
 from transformers import AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
 import folder_paths
+import comfy.model_management as mm
+import comfy.model_patcher
 from pathlib import Path
 from PIL import Image
 from torchvision.transforms import ToPILImage
 import json
 import gc
+import math
 import os
 
 class ModelLoadError(Exception):
@@ -78,34 +81,101 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 
 _MODEL_CACHE = {}
 
+# Loaded size relative to the model in 16-bit (llama-joycaption-beta-one on an RTX 3090:
+# 15.8 GiB bf16, 8.4 GiB 8-bit, 4.8 GiB 4-bit; the vision tower stays unquantized).
+_LOADED_SIZE_RATIO = {"Balanced (8-bit)": 0.55, "Maximum Savings (4-bit)": 0.32}
+
+def expected_load_size(checkpoint_path, model, memory_mode):
+    """Bytes the model will take on the load device, so ComfyUI can make room before from_pretrained.
+
+    Counted from the checkpoint's tensor shapes, not its file size: the FP8-Dynamic checkpoint
+    is 9.4 GiB on disk but loads at 16-bit size under transformers 5."""
+    from safetensors import safe_open
+    elements = 0
+    for f in Path(checkpoint_path).glob("*.safetensors"):
+        with safe_open(str(f), framework="pt") as weights:
+            for key in weights.keys():
+                elements += math.prod(weights.get_slice(key).get_shape())
+    ratio = 1.0 if "FP8-Dynamic" in model else _LOADED_SIZE_RATIO.get(memory_mode, 1.0)
+    return int(elements * 2 * ratio)
+
+try:
+    from bitsandbytes.nn import Linear8bitLt
+except ImportError:
+    Linear8bitLt = None
+
+def _follow_weight(module):
+    """Point a Linear8bitLt's int8 state at its weight's current device.
+
+    bitsandbytes keeps the int8 weight and its scales in module.state (CB/SCB), and before the
+    first forward on the weight itself. A device move through nn.Module._apply moves only the
+    weight's data, so the old CB/SCB kept the GPU copy alive after ComfyUI offloaded the model."""
+    weight = module.weight
+    for holder in (weight, module.state):
+        if getattr(holder, "CB", None) is not None:
+            holder.CB = weight.data
+        scb = getattr(holder, "SCB", None)
+        if scb is not None and scb.device != weight.device:
+            holder.SCB = scb.to(weight.device)
+
+if Linear8bitLt is not None:
+    class _ManagedLinear8bitLt(Linear8bitLt):
+        # ModelPatcher moves modules one at a time with module.to(). Linear8bitLt.to copies
+        # state.CB separately from the weight, which doubles the int8 weights until the next
+        # forward; nn.Module.to plus _follow_weight keeps one copy.
+        def to(self, *args, **kwargs):
+            torch.nn.Module.to(self, *args, **kwargs)
+            _follow_weight(self)
+            return self
+
+class ManagedLlava(torch.nn.Module):
+    """The LLaVA model as ComfyUI's ModelPatcher sees it.
+
+    ModelPatcher sets model.device, which is a read-only property on transformers models, so it
+    gets this holder instead. Moving the holder keeps any 8-bit layers' state with their weights."""
+    def __init__(self, llava):
+        super().__init__()
+        self.llava = llava
+        if Linear8bitLt is not None:
+            for m in llava.modules():
+                if type(m) is Linear8bitLt:
+                    m.__class__ = _ManagedLinear8bitLt
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        if Linear8bitLt is not None:
+            for m in self.llava.modules():
+                if isinstance(m, Linear8bitLt):
+                    _follow_weight(m)
+        return self
+
 class JC_Models:
-    """Handles loading, caching, and running the LLaVA models."""
-    def __init__(self, model: str, memory_mode: str):
+    """Handles loading, caching, and running the LLaVA models.
+
+    The model is registered with ComfyUI's model management through a ModelPatcher, so ComfyUI
+    offloads it like its own models when another load needs the memory, and loads it back for
+    generate()."""
+    def __init__(self, model: str, memory_mode: str, global_cache: bool = False):
         cache_key = f"{model}_{memory_mode}"
-        
-        if cache_key in _MODEL_CACHE:
-            try:
-                self.processor = _MODEL_CACHE[cache_key]["processor"]
-                self.model = _MODEL_CACHE[cache_key]["model"]
-                self.device = _MODEL_CACHE[cache_key]["device"]
-                if not next(self.model.parameters()).is_cuda:
-                    raise RuntimeError("Cached model not on GPU")
-                print(f"Using cached model: {cache_key}")
-                return
-            except Exception as e:
-                print(f"Cache validation failed: {e}, reloading model...")
-                if cache_key in _MODEL_CACHE:
-                    del _MODEL_CACHE[cache_key]
-                torch.cuda.empty_cache()
-        
+
+        if global_cache and cache_key in _MODEL_CACHE:
+            cached = _MODEL_CACHE[cache_key]
+            self.processor = cached["processor"]
+            self.model = cached["model"]
+            self.patcher = cached["patcher"]
+            self.device = cached["device"]
+            self.target_size = cached["target_size"]
+            print(f"Using cached model: {cache_key}")
+            return
+
         checkpoint_path = Path(folder_paths.models_dir) / "LLM" / Path(model).stem
         if not checkpoint_path.exists():
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model, local_dir=str(checkpoint_path), force_download=False, local_files_only=False)
-        
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        if self.device == "cuda":
+
+        self.device = mm.get_torch_device()
+
+        if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
             if hasattr(torch.backends, 'cuda'):
                 if hasattr(torch.backends.cuda, 'matmul'):
@@ -137,10 +207,13 @@ class JC_Models:
             self.target_size = (336, 336)
 
         model_kwargs = {
-            "device_map": "cuda" if self.device == "cuda" else "cpu",
+            "device_map": str(self.device),
         }
 
+        self.model = None
         try:
+            mm.free_memory(expected_load_size(checkpoint_path, model, memory_mode) + mm.minimum_inference_memory(), self.device)
+
             if "FP8-Dynamic" in model:
                 print("Loading FP8 model with automatic configuration...")
                 self.model = LlavaForConditionalGeneration.from_pretrained(
@@ -185,15 +258,24 @@ class JC_Models:
                 )
             
             self.model.eval()
-            
-            if self.device == "cuda" and not next(self.model.parameters()).is_cuda:
+
+            if self.device.type == "cuda" and not next(self.model.parameters()).is_cuda:
                 raise RuntimeError("Model failed to load on GPU")
-            
-            if memory_mode == "Global Cache":
+
+            self.patcher = comfy.model_patcher.ModelPatcher(
+                ManagedLlava(self.model),
+                load_device=self.device,
+                offload_device=mm.unet_offload_device(),
+            )
+            mm.load_models_gpu([self.patcher], force_full_load=True)
+
+            if global_cache:
                 _MODEL_CACHE[cache_key] = {
                     "processor": self.processor,
                     "model": self.model,
-                    "device": self.device
+                    "patcher": self.patcher,
+                    "device": self.device,
+                    "target_size": self.target_size,
                 }
                 
         except Exception as e:
@@ -203,6 +285,9 @@ class JC_Models:
     @torch.inference_mode()
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
         """Generates a caption for the given image."""
+        # Brings the model back if ComfyUI offloaded it since the last run. Full load only:
+        # transformers modules have no lowvram casting, so a partial load would split devices.
+        mm.load_models_gpu([self.patcher], force_full_load=True)
         convo = [
             {"role": "system", "content": system.strip()},
             {"role": "user", "content": prompt.strip()},
@@ -216,7 +301,7 @@ class JC_Models:
         
         image = image.resize(self.target_size, Image.Resampling.LANCZOS)
         
-        inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.device)
+        inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.patcher.load_device)
         
         if hasattr(inputs, 'pixel_values') and inputs['pixel_values'] is not None:
             inputs['pixel_values'] = inputs['pixel_values'].to(self.model.dtype)
@@ -295,15 +380,15 @@ class JC:
             if memory_management == "Global Cache":
                 try:
                     model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
+                    self.predictor = JC_Models(model_name, quantization, global_cache=True)
                 except Exception as e:
                     return (f"Error loading model: {e}",)
             elif self.predictor is None or self.current_memory_mode != quantization or self.current_model != model:
                 if self.predictor is not None:
                     del self.predictor
                     self.predictor = None
-                    torch.cuda.empty_cache()
                     gc.collect()
+                    mm.soft_empty_cache()
                 try:
                     model_name = HF_MODELS[model]["name"]
                     self.predictor = JC_Models(model_name, quantization)
@@ -329,16 +414,16 @@ class JC:
             if memory_management == "Clear After Run":
                 del self.predictor
                 self.predictor = None
-                torch.cuda.empty_cache()
                 gc.collect()
+                mm.soft_empty_cache()
 
             return (response,)
         except Exception as e:
             if memory_management == "Clear After Run":
                 del self.predictor
                 self.predictor = None
-                torch.cuda.empty_cache()
                 gc.collect()
+                mm.soft_empty_cache()
             raise e
 
 class JC_adv:
@@ -382,15 +467,15 @@ class JC_adv:
             if memory_management == "Global Cache":
                 try:
                     model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
+                    self.predictor = JC_Models(model_name, quantization, global_cache=True)
                 except Exception as e:
                     return (f"Error loading model: {e}", "")
             elif self.predictor is None or self.current_memory_mode != quantization or self.current_model != model:
                 if self.predictor is not None:
                     del self.predictor
                     self.predictor = None
-                    torch.cuda.empty_cache()
                     gc.collect()
+                    mm.soft_empty_cache()
                 try:
                     model_name = HF_MODELS[model]["name"]
                     self.predictor = JC_Models(model_name, quantization)
@@ -420,16 +505,16 @@ class JC_adv:
             if memory_management == "Clear After Run":
                 del self.predictor
                 self.predictor = None
-                torch.cuda.empty_cache()
                 gc.collect()
+                mm.soft_empty_cache()
 
             return (prompt, response)
         except Exception as e:
             if memory_management == "Clear After Run":
                 del self.predictor
                 self.predictor = None
-                torch.cuda.empty_cache()
                 gc.collect()
+                mm.soft_empty_cache()
             raise e
 
 NODE_CLASS_MAPPINGS = {
